@@ -58,6 +58,23 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
+def build_prompt(template_content: str, file_content: str, current_date: str, custom_instruction: Optional[str] = None) -> str:
+    """Build processing prompt with template, content, and date."""
+    instruction = custom_instruction or "Update the following markdown document using the provided template as guidance."
+    
+    return f"""{instruction}
+
+TEMPLATE:
+{template_content}
+
+DOCUMENT TO UPDATE:
+{file_content}
+
+IMPORTANT: Replace any "[Date]" placeholders with today's date: {current_date}
+
+Please return only the updated markdown content without any explanations or additional text."""
+
+
 @dataclass
 class ProcessingResult:
     """Result of processing a single file."""
@@ -69,25 +86,25 @@ class ProcessingResult:
     retry_count: int
 
 
-class ProgressTracker:
-    """Tracks and displays processing progress."""
+class ProgressCounter:
+    """Simple atomic counter for tracking progress."""
     
-    def __init__(self, total_files: int):
-        self.total = total_files
+    def __init__(self, total: int):
+        self.total = total
         self.completed = 0
         self.failed = 0
         self.lock = asyncio.Lock()
     
-    async def increment(self, success: bool = True):
-        """Increment the counter thread-safely."""
+    async def mark_complete(self, success: bool = True):
+        """Mark one file as completed."""
         async with self.lock:
             self.completed += 1
             if not success:
                 self.failed += 1
     
-    def get_status(self) -> str:
-        """Get current progress status."""
-        return f"{self.completed}/{self.total} completed ({self.failed} failed)"
+    def status(self) -> str:
+        """Get current status."""
+        return f"{self.completed}/{self.total}"
 
 
 async def process_markdown_file(
@@ -95,7 +112,7 @@ async def process_markdown_file(
     output_path: Path,
     template_content: str,
     semaphore: asyncio.Semaphore,
-    progress: ProgressTracker,
+    progress: ProgressCounter,
     custom_prompt: Optional[str] = None,
     max_retries: int = 3,
 ) -> ProcessingResult:
@@ -107,7 +124,7 @@ async def process_markdown_file(
         output_path: Path to write the transformed file
         template_content: Content of the template file
         semaphore: Semaphore to limit concurrent API calls
-        progress: Progress tracker instance
+        progress: Progress counter instance
         custom_prompt: Optional custom prompt to override default
         max_retries: Maximum number of retry attempts
 
@@ -120,7 +137,7 @@ async def process_markdown_file(
     async with semaphore:
         for attempt in range(max_retries):
             try:
-                logger.info(f"[{progress.get_status()}] Processing: {input_path.name}")
+                logger.info(f"[{progress.status()}] Processing: {input_path.name}")
                 
                 # Read input file
                 file_content = input_path.read_text(encoding="utf-8")
@@ -128,31 +145,8 @@ async def process_markdown_file(
                 # Get current date for "Last updated" field
                 current_date = datetime.now().strftime("%B %d, %Y")
                 
-                # Construct prompt with date information
-                if custom_prompt:
-                    prompt = f"""{custom_prompt}
-
-TEMPLATE TO FOLLOW:
-{template_content}
-
-DOCUMENT TO TRANSFORM:
-{file_content}
-
-IMPORTANT: Replace any "[Date]" placeholders with today's date: {current_date}
-
-Please return only the transformed markdown content without any explanations or additional text."""
-                else:
-                    prompt = f"""Update the following markdown document using the provided template as guidance.
-
-TEMPLATE:
-{template_content}
-
-DOCUMENT TO UPDATE:
-{file_content}
-
-IMPORTANT: Replace any "[Date]" placeholders with today's date: {current_date}
-
-Please return only the updated markdown content without any explanations or additional text."""
+                # Build prompt
+                prompt = build_prompt(template_content, file_content, current_date, custom_prompt)
                 
                 # Configure Claude options
                 options = ClaudeCodeOptions(
@@ -165,22 +159,22 @@ Please return only the updated markdown content without any explanations or addi
                 async for message in query(prompt=prompt, options=options):
                     messages.append(message)
                 
-                # Extract content from messages
-                response_content = None
+                # Extract content from messages - collect ALL text blocks
+                response_parts = []
                 for message in reversed(messages):
                     if hasattr(message, 'result') and message.result:
-                        response_content = message.result
+                        response_parts = [message.result]
                         break
                     elif hasattr(message, 'content') and message.content:
                         if isinstance(message.content, list):
                             for block in message.content:
                                 if hasattr(block, 'text'):
-                                    response_content = block.text
-                                    break
+                                    response_parts.append(block.text)
                         elif isinstance(message.content, str):
-                            response_content = message.content
-                            break
+                            response_parts = [message.content]
+                        break
                 
+                response_content = "".join(response_parts)
                 if not response_content:
                     raise ValueError("Received empty response from Claude")
                 
@@ -189,12 +183,9 @@ Please return only the updated markdown content without any explanations or addi
                 output_path.write_text(response_content, encoding="utf-8")
                 
                 # Update progress and log success
-                await progress.increment(success=True)
+                await progress.mark_complete(success=True)
                 processing_time = time.time() - start_time
-                logger.info(
-                    f"[{progress.get_status()}] ✓ Completed: {output_path.name} "
-                    f"({processing_time:.1f}s)"
-                )
+                logger.info(f"✓ {output_path.name} ({processing_time:.1f}s)")
                 
                 return ProcessingResult(
                     success=True,
@@ -210,19 +201,15 @@ Please return only the updated markdown content without any explanations or addi
                 if attempt < max_retries - 1:
                     wait_time = 2 ** attempt  # Exponential backoff
                     logger.warning(
-                        f"[{progress.get_status()}] Retry {retry_count}/{max_retries-1} "
-                        f"for {input_path.name} after error: {str(e)}. "
+                        f"Retry {retry_count}/{max_retries-1} for {input_path.name}: {str(e)}. "
                         f"Waiting {wait_time}s..."
                     )
                     await asyncio.sleep(wait_time)
                 else:
                     # Final failure
-                    await progress.increment(success=False)
+                    await progress.mark_complete(success=False)
                     processing_time = time.time() - start_time
-                    logger.error(
-                        f"[{progress.get_status()}] ✗ Failed: {input_path.name} "
-                        f"after {retry_count} retries: {str(e)}"
-                    )
+                    logger.error(f"✗ {input_path.name} failed after {retry_count} retries: {str(e)}")
                     
                     return ProcessingResult(
                         success=False,
@@ -250,8 +237,11 @@ def print_summary(results: List[ProcessingResult], total_time: float) -> None:
     if successes:
         avg_time = sum(r.processing_time for r in successes) / len(successes)
         print(f"Average processing time: {avg_time:.1f}s per file")
-    
-    print(f"Concurrent processing speedup: {sum(r.processing_time for r in results) / total_time:.1f}x")
+        
+        # Show theoretical vs actual time (not a "speedup" metric)
+        total_sequential_time = sum(r.processing_time for r in results)
+        efficiency = (total_sequential_time / total_time) if total_time > 0 else 0
+        print(f"Parallelization efficiency: {efficiency:.1f}x (theoretical max: concurrency level)")
     
     if failures:
         print("\n" + "-" * 60)
@@ -348,7 +338,7 @@ async def main() -> None:
     # Process files concurrently
     start_time = time.time()
     semaphore = asyncio.Semaphore(args.concurrency)
-    progress = ProgressTracker(len(md_files))
+    progress = ProgressCounter(len(md_files))
     
     tasks = [
         process_markdown_file(

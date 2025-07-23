@@ -1,11 +1,17 @@
 #!/usr/bin/env python3
 """
-Markdown Document Processor using Claude Code SDK
+Concurrent Markdown Document Processor using Claude Code SDK
 
-This script processes markdown files by using Claude AI to transform them
-according to a provided template. It reads all .md files from an input
-directory, processes them through Claude with the template as guidance,
-and saves the transformed documents to an output directory.
+This script processes markdown files concurrently using Claude AI to transform
+them according to a provided template. It supports configurable concurrency
+limits, comprehensive error handling, and detailed progress reporting.
+
+Key Features:
+- Concurrent processing with configurable limits
+- Retry logic for transient failures
+- Progress tracking with real-time updates
+- Comprehensive error reporting
+- Support for custom prompts
 
 Requirements:
     - Python 3.10+
@@ -13,238 +19,364 @@ Requirements:
     - Claude Code CLI installed and configured
 
 Usage:
-    python process_docs.py <input_dir> <output_dir> <template_file> [--prompt "custom prompt"]
+    python process_docs_concurrent.py <input_dir> <output_dir> <template_file> [options]
 
-Example:
-    python process_docs.py ./raw_docs ./formatted_docs ./template.md
-    python process_docs.py ./notes ./reports ./report_template.md --prompt "Convert to formal report"
+Examples:
+    python process_docs_concurrent.py ./raw_docs ./formatted_docs ./template.md -c 10
+    python process_docs_concurrent.py ./notes ./reports ./report_template.md --prompt "Convert to formal report"
 
 Author: Claude Assistant
-Version: 1.0.0
+Version: 2.0.0
 """
 
 import asyncio
 import logging
+import argparse
 from pathlib import Path
-from typing import Optional, List
 import sys
+import time
+from typing import Optional, Tuple, List
+from dataclasses import dataclass
+from datetime import datetime
 
 try:
     from claude_code_sdk import query, ClaudeCodeOptions, Message
 except ImportError:
-    print("Error: claude-code-sdk not installed. Please run: pip install claude-code-sdk")
+    print(
+        "Error: claude-code-sdk not installed. Please run: pip install claude-code-sdk",
+        file=sys.stderr,
+    )
     sys.exit(1)
 
 
+# Configure logging
 logging.basicConfig(
     level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s'
+    format="%(asctime)s - %(levelname)s - %(message)s",
+    stream=sys.stdout,
 )
 logger = logging.getLogger(__name__)
 
 
-class MarkdownProcessor:
+@dataclass
+class ProcessingResult:
+    """Result of processing a single file."""
+    success: bool
+    file_path: Path
+    output_path: Optional[Path]
+    error: Optional[str]
+    processing_time: float
+    retry_count: int
+
+
+class ProgressTracker:
+    """Tracks and displays processing progress."""
+    
+    def __init__(self, total_files: int):
+        self.total = total_files
+        self.completed = 0
+        self.failed = 0
+        self.lock = asyncio.Lock()
+    
+    async def increment(self, success: bool = True):
+        """Increment the counter thread-safely."""
+        async with self.lock:
+            self.completed += 1
+            if not success:
+                self.failed += 1
+    
+    def get_status(self) -> str:
+        """Get current progress status."""
+        return f"{self.completed}/{self.total} completed ({self.failed} failed)"
+
+
+async def process_markdown_file(
+    input_path: Path,
+    output_path: Path,
+    template_content: str,
+    semaphore: asyncio.Semaphore,
+    progress: ProgressTracker,
+    custom_prompt: Optional[str] = None,
+    max_retries: int = 3,
+) -> ProcessingResult:
     """
-    A processor for transforming markdown documents using Claude AI.
-    
-    This class handles the batch processing of markdown files, using a template
-    to guide Claude in transforming documents into a consistent format.
-    
-    Attributes:
-        input_dir (Path): Directory containing markdown files to process
-        output_dir (Path): Directory where processed files will be saved
-        template_file (Path): Template markdown file used as guidance
-        template_content (str): Content of the template file
+    Process a single markdown file using Claude with retry logic.
+
+    Args:
+        input_path: Path to the source markdown file
+        output_path: Path to write the transformed file
+        template_content: Content of the template file
+        semaphore: Semaphore to limit concurrent API calls
+        progress: Progress tracker instance
+        custom_prompt: Optional custom prompt to override default
+        max_retries: Maximum number of retry attempts
+
+    Returns:
+        ProcessingResult with status and details
     """
+    start_time = time.time()
+    retry_count = 0
     
-    def __init__(self, input_dir: str, output_dir: str, template_file: str):
-        """
-        Initialize the MarkdownProcessor with directories and template.
-        
-        Args:
-            input_dir: Path to directory containing .md files to process
-            output_dir: Path to directory where processed files will be saved
-            template_file: Path to template .md file for document structure
-            
-        Raises:
-            ValueError: If input_dir or template_file doesn't exist
-        """
-        self.input_dir = Path(input_dir)
-        self.output_dir = Path(output_dir)
-        self.template_file = Path(template_file)
-        
-        if not self.input_dir.exists():
-            raise ValueError(f"Input directory '{input_dir}' does not exist")
-        
-        if not self.template_file.exists():
-            raise ValueError(f"Template file '{template_file}' does not exist")
-        
-        self.output_dir.mkdir(parents=True, exist_ok=True)
-        
-        with open(self.template_file, 'r', encoding='utf-8') as f:
-            self.template_content = f.read()
-    
-    async def process_file(self, file_path: Path, custom_prompt: Optional[str] = None) -> str:
-        """
-        Process a single markdown file using Claude AI.
-        
-        Args:
-            file_path: Path to the markdown file to process
-            custom_prompt: Optional custom prompt to override the default
-            
-        Returns:
-            str: The processed markdown content
-            
-        Note:
-            If processing fails, returns the original file content
-        """
-        logger.info(f"Processing: {file_path.name}")
-        
-        with open(file_path, 'r', encoding='utf-8') as f:
-            file_content = f.read()
-        
-        if custom_prompt:
-            # Include document and template in custom prompt
-            prompt = f"""{custom_prompt}
+    async with semaphore:
+        for attempt in range(max_retries):
+            try:
+                logger.info(f"[{progress.get_status()}] Processing: {input_path.name}")
+                
+                # Read input file
+                file_content = input_path.read_text(encoding="utf-8")
+                
+                # Get current date for "Last updated" field
+                current_date = datetime.now().strftime("%B %d, %Y")
+                
+                # Construct prompt with date information
+                if custom_prompt:
+                    prompt = f"""{custom_prompt}
 
 TEMPLATE TO FOLLOW:
-{self.template_content}
+{template_content}
 
 DOCUMENT TO TRANSFORM:
 {file_content}
 
+IMPORTANT: Replace any "[Date]" placeholders with today's date: {current_date}
+
 Please return only the transformed markdown content without any explanations or additional text."""
-        else:
-            # Use default prompt
-            prompt = f"""Update the following markdown document using the provided template as guidance.
+                else:
+                    prompt = f"""Update the following markdown document using the provided template as guidance.
 
 TEMPLATE:
-{self.template_content}
+{template_content}
 
 DOCUMENT TO UPDATE:
 {file_content}
 
+IMPORTANT: Replace any "[Date]" placeholders with today's date: {current_date}
+
 Please return only the updated markdown content without any explanations or additional text."""
-        
-        messages: list[Message] = []
-        
-        options = ClaudeCodeOptions(
-            max_turns=1,
-            system_prompt="You are a markdown document processor. Return only the processed markdown content without any explanations.",
-            allowed_tools=[]  # Disable tools to ensure direct response
-        )
-        
-        try:
-            async for message in query(prompt=prompt, options=options):
-                messages.append(message)
-                logger.debug(f"Message type: {type(message)}, Message: {message}")
-            
-            # Extract text content from messages
-            if messages:
-                # Look for ResultMessage with result content
+                
+                # Configure Claude options
+                options = ClaudeCodeOptions(
+                    max_turns=1,
+                    system_prompt="You are a markdown document processor. Your response must be ONLY the processed markdown content. Do not use any tools, do not provide explanations, do not ask questions. Output only the formatted markdown document."
+                )
+                
+                # Process with Claude
+                messages = []
+                async for message in query(prompt=prompt, options=options):
+                    messages.append(message)
+                
+                # Extract content from messages
+                response_content = None
                 for message in reversed(messages):
                     if hasattr(message, 'result') and message.result:
-                        return message.result
+                        response_content = message.result
+                        break
                     elif hasattr(message, 'content') and message.content:
-                        # Handle AssistantMessage with TextBlock
                         if isinstance(message.content, list):
                             for block in message.content:
                                 if hasattr(block, 'text'):
-                                    return block.text
+                                    response_content = block.text
+                                    break
                         elif isinstance(message.content, str):
-                            return message.content
+                            response_content = message.content
+                            break
                 
-                logger.error(f"No valid content found in messages for {file_path.name}")
-                return file_content
-            else:
-                logger.error(f"No messages received for {file_path.name}")
-                return file_content
+                if not response_content:
+                    raise ValueError("Received empty response from Claude")
                 
-        except Exception as e:
-            logger.error(f"Error processing {file_path.name}: {str(e)}")
-            return file_content
-    
-    async def process_all_files(self, custom_prompt: Optional[str] = None) -> None:
-        """
-        Process all markdown files in the input directory.
-        
-        This method finds all .md files in the input directory, processes each
-        one through Claude using the template, and saves the results to the
-        output directory. Processing continues even if individual files fail.
-        
-        Args:
-            custom_prompt: Optional custom prompt to use for all files
-            
-        Note:
-            Files are processed sequentially to avoid rate limiting.
-            Failed files will retain their original content in the output.
-        """
-        md_files = list(self.input_dir.glob("*.md"))
-        
-        if not md_files:
-            logger.warning(f"No markdown files found in {self.input_dir}")
-            return
-        
-        logger.info(f"Found {len(md_files)} markdown file(s) to process")
-        
-        for file_path in md_files:
-            try:
-                updated_content = await self.process_file(file_path, custom_prompt)
+                # Save output
+                output_path.parent.mkdir(parents=True, exist_ok=True)
+                output_path.write_text(response_content, encoding="utf-8")
                 
-                output_path = self.output_dir / file_path.name
-                with open(output_path, 'w', encoding='utf-8') as f:
-                    f.write(updated_content)
+                # Update progress and log success
+                await progress.increment(success=True)
+                processing_time = time.time() - start_time
+                logger.info(
+                    f"[{progress.get_status()}] ✓ Completed: {output_path.name} "
+                    f"({processing_time:.1f}s)"
+                )
                 
-                logger.info(f"Saved updated file: {output_path}")
+                return ProcessingResult(
+                    success=True,
+                    file_path=input_path,
+                    output_path=output_path,
+                    error=None,
+                    processing_time=processing_time,
+                    retry_count=retry_count
+                )
                 
             except Exception as e:
-                logger.error(f"Failed to process {file_path.name}: {str(e)}")
-                continue
-        
-        logger.info("Processing complete!")
+                retry_count += 1
+                if attempt < max_retries - 1:
+                    wait_time = 2 ** attempt  # Exponential backoff
+                    logger.warning(
+                        f"[{progress.get_status()}] Retry {retry_count}/{max_retries-1} "
+                        f"for {input_path.name} after error: {str(e)}. "
+                        f"Waiting {wait_time}s..."
+                    )
+                    await asyncio.sleep(wait_time)
+                else:
+                    # Final failure
+                    await progress.increment(success=False)
+                    processing_time = time.time() - start_time
+                    logger.error(
+                        f"[{progress.get_status()}] ✗ Failed: {input_path.name} "
+                        f"after {retry_count} retries: {str(e)}"
+                    )
+                    
+                    return ProcessingResult(
+                        success=False,
+                        file_path=input_path,
+                        output_path=None,
+                        error=str(e),
+                        processing_time=processing_time,
+                        retry_count=retry_count
+                    )
+
+
+def print_summary(results: List[ProcessingResult], total_time: float) -> None:
+    """Print a detailed summary of processing results."""
+    successes = [r for r in results if r.success]
+    failures = [r for r in results if not r.success]
+    
+    print("\n" + "=" * 60)
+    print(" " * 20 + "PROCESSING SUMMARY")
+    print("=" * 60)
+    print(f"Total files processed: {len(results)}")
+    print(f"Successful: {len(successes)}")
+    print(f"Failed: {len(failures)}")
+    print(f"Total time: {total_time:.1f}s")
+    
+    if successes:
+        avg_time = sum(r.processing_time for r in successes) / len(successes)
+        print(f"Average processing time: {avg_time:.1f}s per file")
+    
+    print(f"Concurrent processing speedup: {sum(r.processing_time for r in results) / total_time:.1f}x")
+    
+    if failures:
+        print("\n" + "-" * 60)
+        print("FAILED FILES:")
+        print("-" * 60)
+        for result in failures:
+            print(f"  • {result.file_path.name}")
+            print(f"    Error: {result.error}")
+            print(f"    Retries: {result.retry_count}")
+    
+    print("=" * 60)
 
 
 async def main() -> None:
-    """
-    Main entry point for the markdown processor script.
-    
-    Parses command-line arguments, initializes the processor, and runs
-    the batch processing operation. Handles errors gracefully with
-    appropriate exit codes.
-    
-    Exit codes:
-        0: Success
-        1: Configuration or runtime error
-    """
-    import argparse
-    
-    parser = argparse.ArgumentParser(description="Process markdown files using Claude Code SDK")
-    parser.add_argument("input_dir", help="Directory containing markdown files to process")
-    parser.add_argument("output_dir", help="Directory to save processed files")
-    parser.add_argument("template_file", help="Template markdown file to use as guidance")
-    parser.add_argument("--prompt", help="Custom prompt to use (optional)", default=None)
+    """Main entry point for the concurrent processor."""
+    parser = argparse.ArgumentParser(
+        description="Concurrently process markdown files using Claude AI",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
+    parser.add_argument(
+        "input_dir", 
+        type=Path, 
+        help="Directory containing markdown files to process"
+    )
+    parser.add_argument(
+        "output_dir", 
+        type=Path, 
+        help="Directory to save processed files"
+    )
+    parser.add_argument(
+        "template_file", 
+        type=Path, 
+        help="Template markdown file for document structure"
+    )
+    parser.add_argument(
+        "--prompt",
+        type=str,
+        default=None,
+        help="Custom prompt to override the default processing instruction"
+    )
+    parser.add_argument(
+        "-c", "--concurrency",
+        type=int,
+        default=5,
+        help="Maximum number of files to process concurrently"
+    )
+    parser.add_argument(
+        "--max-retries",
+        type=int,
+        default=3,
+        help="Maximum retry attempts for failed files"
+    )
     
     args = parser.parse_args()
     
-    try:
-        processor = MarkdownProcessor(
-            input_dir=args.input_dir,
-            output_dir=args.output_dir,
-            template_file=args.template_file
-        )
-        
-        await processor.process_all_files(custom_prompt=args.prompt)
-        
-    except ValueError as e:
-        logger.error(f"Configuration error: {e}")
+    # Validate inputs
+    if not args.input_dir.is_dir():
+        logger.error(f"Input directory not found: {args.input_dir}")
         sys.exit(1)
-    except KeyboardInterrupt:
-        logger.info("Process interrupted by user")
-        sys.exit(0)
+    
+    if not args.template_file.is_file():
+        logger.error(f"Template file not found: {args.template_file}")
+        sys.exit(1)
+    
+    if args.concurrency < 1:
+        logger.error("Concurrency must be at least 1")
+        sys.exit(1)
+    
+    # Setup
+    args.output_dir.mkdir(parents=True, exist_ok=True)
+    
+    try:
+        template_content = args.template_file.read_text(encoding="utf-8")
     except Exception as e:
-        logger.error(f"Unexpected error: {e}")
+        logger.error(f"Failed to read template file: {e}")
+        sys.exit(1)
+    
+    # Find markdown files
+    md_files = list(args.input_dir.glob("*.md"))
+    if not md_files:
+        logger.warning(f"No markdown files found in {args.input_dir}")
+        return
+    
+    concurrency_mode = "sequential" if args.concurrency == 1 else f"concurrent (limit: {args.concurrency})"
+    logger.info(f"Found {len(md_files)} markdown files. Starting {concurrency_mode} processing...")
+    
+    if len(md_files) <= 10:
+        # Show file list for small batches
+        logger.info(f"Files to process: {', '.join(f.name for f in md_files)}")
+    else:
+        # Just show first few for large batches
+        logger.info(f"Files include: {', '.join(f.name for f in md_files[:3])}, ... and {len(md_files) - 3} more")
+    
+    # Process files concurrently
+    start_time = time.time()
+    semaphore = asyncio.Semaphore(args.concurrency)
+    progress = ProgressTracker(len(md_files))
+    
+    tasks = [
+        process_markdown_file(
+            input_path=file_path,
+            output_path=args.output_dir / file_path.name,
+            template_content=template_content,
+            semaphore=semaphore,
+            progress=progress,
+            custom_prompt=args.prompt,
+            max_retries=args.max_retries,
+        )
+        for file_path in md_files
+    ]
+    
+    results = await asyncio.gather(*tasks)
+    total_time = time.time() - start_time
+    
+    # Print summary
+    print_summary(results, total_time)
+    
+    # Exit with error code if any failures
+    if any(not r.success for r in results):
         sys.exit(1)
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        logger.info("\nProcess interrupted by user")
+        sys.exit(130)  # Standard exit code for SIGINT
